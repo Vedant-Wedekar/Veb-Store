@@ -1,0 +1,154 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isValidHttpsUrlOrEmpty(url) {
+      return url == null || url == '' || url.matches('https://.*');
+    }
+
+    // ---------- users ----------
+    // Anyone can read a public profile. A user may only create/update their
+    // own document, and may never change immutable identity fields or
+    // self-report fabricated aggregate stats.
+    match /users/{uid} {
+      allow read: if true;
+
+      allow create: if isOwner(uid)
+        && request.resource.data.uid == null // uid is the doc id, not a field we trust from client
+        && request.resource.data.productCount == 0
+        && request.resource.data.totalViews == 0
+        && request.resource.data.totalClicks == 0
+        && request.resource.data.avgRating == 0;
+
+      allow update: if isOwner(uid)
+        && request.resource.data.username == resource.data.username
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.createdAt == resource.data.createdAt
+        // aggregate counters are only ever changed by trusted server-side
+        // logic / Cloud Functions in a full production setup, never directly
+        // by the client during a profile edit:
+        && request.resource.data.productCount == resource.data.productCount
+        && request.resource.data.totalViews == resource.data.totalViews
+        && request.resource.data.totalClicks == resource.data.totalClicks
+        && request.resource.data.avgRating == resource.data.avgRating;
+
+      allow delete: if false;
+    }
+
+    // Reserves a username -> uid mapping so usernames stay unique.
+    match /usernames/{username} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // ---------- products ----------
+    match /products/{productId} {
+      // Public products are readable by everyone. Drafts/archived are only
+      // readable by their owner.
+      allow read: if resource.data.status == 'published'
+        || (isSignedIn() && resource.data.ownerId == request.auth.uid);
+
+      allow create: if isSignedIn()
+        && request.resource.data.ownerId == request.auth.uid
+        && isValidHttpsUrlOrEmpty(request.resource.data.websiteUrl)
+        && request.resource.data.views == 0
+        && request.resource.data.clicks == 0
+        && request.resource.data.ratingAvg == 0
+        && request.resource.data.ratingCount == 0
+        && request.resource.data.reviewCount == 0;
+
+      // Owner can edit their own product but not silently inflate their own
+      // analytics or rating aggregates from the client.
+      allow update: if isSignedIn() && resource.data.ownerId == request.auth.uid
+        && request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.views == resource.data.views
+        && request.resource.data.clicks == resource.data.clicks
+        && request.resource.data.ratingAvg == resource.data.ratingAvg
+        && request.resource.data.ratingCount == resource.data.ratingCount
+        && request.resource.data.ratingDistribution == resource.data.ratingDistribution
+        && request.resource.data.reviewCount == resource.data.reviewCount;
+
+      // View/click counters and rating aggregates: allow any signed-in-or-anonymous
+      // increment-only update limited to those specific fields. This keeps the
+      // demo functional without a backend, while still blocking arbitrary field
+      // tampering or ownership changes.
+      allow update: if request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['views', 'clicks'])
+        && request.resource.data.views >= resource.data.views
+        && request.resource.data.clicks >= resource.data.clicks;
+
+      // Rating aggregate fields are recomputed client-side inside a Firestore
+      // transaction (see applyRatingTransaction in productService.ts) since
+      // this project intentionally has no backend/Cloud Functions. Any
+      // signed-in user may touch these three fields alone — a real
+      // production deployment should move this aggregation into a Cloud
+      // Function triggered off the `ratings` collection instead.
+      allow update: if isSignedIn()
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['ratingAvg', 'ratingCount', 'ratingDistribution']);
+
+      allow update: if isSignedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reviewCount']);
+
+      allow delete: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+    }
+
+    // ---------- ratings ----------
+    // Doc id convention: `${productId}_${userId}` so a user can only ever
+    // have one rating per product, enforced by document id ownership.
+    match /ratings/{ratingId} {
+      allow read: if true;
+      allow create, update: if isSignedIn()
+        && ratingId == (request.resource.data.productId + '_' + request.auth.uid)
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.value is int
+        && request.resource.data.value >= 1
+        && request.resource.data.value <= 5;
+      allow delete: if false;
+    }
+
+    // ---------- reviews ----------
+    match /reviews/{reviewId} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid;
+      allow update: if isSignedIn() && resource.data.authorId == request.auth.uid
+        && request.resource.data.authorId == resource.data.authorId
+        && request.resource.data.productId == resource.data.productId;
+      allow delete: if isSignedIn() && resource.data.authorId == request.auth.uid;
+    }
+
+    // ---------- bookmarks ----------
+    // Doc id convention: `${productId}_${userId}`.
+    match /bookmarks/{bookmarkId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn()
+        && bookmarkId == (request.resource.data.productId + '_' + request.auth.uid)
+        && request.resource.data.userId == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow update: if false;
+    }
+
+    // ---------- reports ----------
+    // Write-only from the client; only future moderator tooling reads these.
+    match /reports/{reportId} {
+      allow create: if isSignedIn() && request.resource.data.reporterId == request.auth.uid;
+      allow read, update, delete: if false;
+    }
+
+    // ---------- analytics (optional daily aggregation docs) ----------
+    match /analytics/{docId} {
+      allow read: if false;
+      allow write: if false; // reserved for future server-side aggregation
+    }
+  }
+}
